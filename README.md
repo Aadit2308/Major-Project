@@ -1,987 +1,326 @@
-# 📡 LoRa Based Communication System
+# 📡 Energy-Aware Greedy Relay Mesh Network over LoRa
 
-A **LoRa-based long-range communication system** developed using **ESP32 microcontrollers and LoRa modules** to enable wireless data communication with separate **Normal Mode** and **Emergency Mode** operations.
+**Hybrid RSSI–Battery Greedy Relay Selection for Energy-Efficient Multi-Hop LoRa Mesh Networks in Disaster Scenarios**
 
-The system is designed to provide communication over long distances with low power consumption and without depending on conventional communication infrastructure such as cellular networks or Wi-Fi. It combines embedded ESP32/LoRa firmware with Python-based processing, load handling, weight-based processing, and data visualization.
+A multi-hop **LoRa mesh network** built on **ESP32 / ESP8266 nodes**, where every node picks the *next hop* on the fly using a **greedy relay score that blends link quality (RSSI) with the relay's remaining battery**. The goal is a mesh that keeps routing data after a disaster knocks out cellular/Wi-Fi infrastructure — without draining the first "good signal" node to zero while idle nodes sit at full charge.
+
+This repository contains the **firmware** (Arduino `.ino` for ESP32/ESP8266 + LoRa), the **Python simulators** used to design and validate the routing algorithm before flashing hardware, and the **Monte Carlo sweep results** used to tune the algorithm's weighting.
+
+
 
 ---
 
 ## 📌 Table of Contents
 
 * [Project Overview](#-project-overview)
-* [Objectives](#-objectives)
-* [System Architecture](#-system-architecture)
-* [Operating Modes](#-operating-modes)
-* [Project Structure](#-project-structure)
-* [Detailed File Description](#-detailed-file-description)
+* [How Relay Selection Works](#-how-relay-selection-works)
+* [Probe-Then-Send Protocol](#-probe-then-send-protocol)
+* [Repository Structure](#-repository-structure)
+* [Firmware Files](#-firmware-files)
+* [Known Bugs Fixed in `_FIXED` Firmware](#-known-bugs-fixed-in-_fixed-firmware)
+* [Python Simulation & Tooling](#-python-simulation--tooling)
 * [Hardware Requirements](#-hardware-requirements)
-* [Software Requirements](#-software-requirements)
-* [Installation](#-installation)
-* [ESP32 Setup](#-esp32-setup)
-* [LoRa Configuration](#-lora-configuration)
-* [System Workflow](#-system-workflow)
-* [Emergency Communication](#-emergency-communication)
-* [Data Visualization](#-data-visualization)
+* [Wiring](#-wiring)
+* [Software Requirements & Installation](#-software-requirements--installation)
+* [Flashing a Mesh Node](#-flashing-a-mesh-node)
+* [Running the Python Tools](#-running-the-python-tools)
+* [Simulation Results](#-simulation-results)
 * [Applications](#-applications)
-* [Advantages](#-advantages)
 * [Limitations](#-limitations)
-* [Testing and Performance Evaluation](#-testing-and-performance-evaluation)
 * [Future Improvements](#-future-improvements)
-* [Project Information](#-project-information)
 * [License](#-license)
 
 ---
 
 # 📌 Project Overview
 
-The **LoRa Based Communication System** implements wireless communication using **LoRa (Long Range)** technology.
+Standard LoRa "shortest path / strongest signal" routing tends to keep funneling traffic through whichever node happens to have the best RSSI — which quietly drains that node's battery while its neighbors idle. This project instead scores every candidate relay with a **weighted combination of normalized RSSI and normalized remaining battery**:
 
-The primary objective is to establish a communication link capable of operating over long distances while maintaining low power consumption and reducing dependence on conventional communication infrastructure.
+```
+score = w1 * normalized_RSSI + w2 * normalized_battery
+```
 
-The system is built around **ESP32 microcontrollers and LoRa modules** and includes software components for:
-
-* Normal communication
-* Emergency communication
-* Load/data processing
-* Weight-based processing
-* LoRa transmission and reception
-* Data visualization
-
-The project can be considered as a combination of three major layers:
+`w1` and `w2` are tuned via Monte Carlo simulation (see [`best_weight.py`](#-python-simulation--tooling) and [`lora_ai_optimizer.py`](#-python-simulation--tooling)) rather than guessed, trading a small amount of raw packet delivery ratio for a much longer overall network lifetime.
 
 ```text
-┌─────────────────────────────────────────────┐
-│              APPLICATION LAYER              │
-│                                             │
-│ Normal Mode     Emergency Mode              │
-│ Load Processing Weight Processing           │
-│                                             │
-│          Python Processing Programs         │
-└──────────────────────┬──────────────────────┘
-                       │
-                       ▼
-┌─────────────────────────────────────────────┐
-│        COMMUNICATION / EMBEDDED LAYER       │
-│                                             │
-│              ESP32 + LoRa                   │
-│       Transmitter / Receiver Firmware       │
-└──────────────────────┬──────────────────────┘
-                       │
-                  LoRa Wireless
-                  Communication
-                       │
-                       ▼
-┌─────────────────────────────────────────────┐
-│              MONITORING LAYER               │
-│                                             │
-│              Data Visualization             │
-└─────────────────────────────────────────────┘
+┌───────────────────────────────────────────────┐
+│                APPLICATION LAYER               │
+│   Weight tuning (Monte Carlo) · Visualization  │
+│        best_weight.py · lora_ai_optimizer.py   │
+│                   visualizer.py                │
+└───────────────────────┬─────────────────────────┘
+                        │
+                        ▼
+┌───────────────────────────────────────────────┐
+│           EMBEDDED / MESH ROUTING LAYER        │
+│   ESP32 / ESP8266 + SX127x LoRa module         │
+│   Neighbor table · Greedy scoring · TX queue   │
+│   node_TEMPLATE_esp32.ino / esp8266.ino        │
+└───────────────────────┬─────────────────────────┘
+                        │
+                   LoRa Wireless
+                   Multi-Hop Link
+                        │
+                        ▼
+┌───────────────────────────────────────────────┐
+│              DESTINATION / LOGGING             │
+│      Serial output · result_*.csv logging      │
+└───────────────────────────────────────────────┘
 ```
 
 ---
 
-# 🎯 Objectives
+# 🧠 How Relay Selection Works
 
-The major objectives of the project are:
+Each node keeps a small **neighbor table** (`Neighbor{ id, rssi, battery, hop, last_seen, score }`) built from HELLO exchanges. When a node needs to send data to a destination it doesn't have a direct link's worth of confidence in, it:
 
-1. Develop a reliable long-range wireless communication system.
-2. Implement LoRa-based communication between embedded devices.
-3. Provide separate **Normal** and **Emergency** operating modes.
-4. Enable communication when conventional network infrastructure is unavailable.
-5. Process and prioritize information according to system conditions.
-6. Provide visualization for monitoring and analysis.
-7. Develop a low-power and scalable communication architecture.
+1. Normalizes the neighbor's RSSI between `RSSI_MIN (-120 dBm)` and `RSSI_MAX (-40 dBm)`.
+2. Normalizes the neighbor's last-reported battery percentage.
+3. Computes `score = W1*rssi_norm + W2*battery_norm` (default `W1=0.6`, `W2=0.4`).
+4. Picks the highest-scoring neighbor as the next hop, subject to `SCORE_THRESHOLD` and `MAX_HOPS`.
 
----
-
-# 🏗️ System Architecture
-
-The system consists of ESP32-based communication nodes connected through LoRa modules. Data is collected and processed before being transmitted through the LoRa communication link.
-
-```text
-                    ┌──────────────────────┐
-                    │      INPUT DATA      │
-                    └──────────┬───────────┘
-                               │
-                               ▼
-                    ┌──────────────────────┐
-                    │   DATA PROCESSING    │
-                    │    / LOAD HANDLING   │
-                    └──────────┬───────────┘
-                               │
-                     ┌─────────┴─────────┐
-                     │                   │
-                     ▼                   ▼
-              ┌──────────────┐    ┌──────────────┐
-              │  NORMAL MODE │    │ EMERGENCY    │
-              │              │    │    MODE      │
-              └──────┬───────┘    └──────┬───────┘
-                     │                   │
-                     └─────────┬─────────┘
-                               │
-                               ▼
-                    ┌──────────────────────┐
-                    │   LoRa TRANSMITTER   │
-                    └──────────┬───────────┘
-                               │
-                         LoRa Wireless
-                         Communication
-                               │
-                               ▼
-                    ┌──────────────────────┐
-                    │    LoRa RECEIVER     │
-                    │        / ESP32       │
-                    └──────────┬───────────┘
-                               │
-                               ▼
-                    ┌──────────────────────┐
-                    │ DATA PROCESSING /    │
-                    │    VISUALIZATION     │
-                    └──────────────────────┘
-```
-
-This architecture separates application-level processing from the embedded communication layer and monitoring layer.
+Every node also runs a simple **energy model** locally (`TX_COST`, `RX_COST`, `IDLE_DRAIN`) so its self-reported battery level actually depletes over the simulation/demo, which keeps the greedy score honest during long-running tests.
 
 ---
 
-# 🔄 Operating Modes
+# 🔁 Probe-Then-Send Protocol
 
-## 1. Normal Mode
-
-**Normal Mode** is the standard operating state of the system.
-
-It is used when there is no emergency condition requiring priority handling.
-
-The general process is:
+Rather than blindly trusting stale neighbor-table entries, every send does a fresh probe first:
 
 ```text
-Input Data
-    ↓
-Data Collection
-    ↓
-Data Processing
-    ↓
-Normal Mode
-    ↓
-LoRa Transmission
-    ↓
-LoRa Receiver
-    ↓
-Received Data Processing
-    ↓
-Output / Display
+1. [INIT] Node ready, message typed (or "<DEST_ID>:<message>" on template firmware)
+2. [TX]   Send probe HELLO to destination
+3. [WAIT] Wait up to HELLO_REPLY_WAIT (3s) for a fresh HELLO reply carrying live RSSI
+4. [CALC] Run greedy score against the neighbor table
+5. [TX]   Send DATA packet via the chosen relay
+6. [RX]   Receiver logs: "Received <msg> | Greedy score: X"
 ```
 
-The normal-mode implementation is associated with:
-
-```text
-Normal_Mode.py
-```
-
-The normal communication workflow consists of collecting input data, processing it, transmitting the required information through LoRa, receiving it at the destination node, and processing/displaying the received information.
+If no reply arrives in time, the node falls back to its cached neighbor-table entry (if any) or drops the send and retries with jittered backoff (`MIN_BACKOFF_MS`–`MAX_BACKOFF_MS`) to avoid collisions on shared airtime.
 
 ---
 
-## 2. Emergency Mode
-
-**Emergency Mode** is intended for situations where important or urgent information must be communicated with higher priority.
-
-The system distinguishes emergency information from regular communication and provides a separate path for handling such information.
-
-The emergency-mode implementation is associated with:
-
-```text
-Emergency_mode.py
-```
-
-Conceptually:
-
-```text
-              Incoming Data
-                   │
-                   ▼
-             Priority Check
-                   │
-          ┌────────┴────────┐
-          │                 │
-          ▼                 ▼
-    Normal Data       Emergency Data
-          │                 │
-          ▼                 ▼
-    Normal Handling   Priority Handling
-          │                 │
-          └────────┬────────┘
-                   │
-                   ▼
-              LoRa Link
-```
-
-The exact emergency trigger and priority mechanism should be configured according to the final deployment requirements.
-
----
-
-# 📁 Project Structure
+# 📁 Repository Structure
 
 ```text
 Major-Project/
 │
-├── Emergency_mode.py
-├── Load_part.py
-├── Normal_Mode.py
-├── best_weight.py
-├── visualizer.py
+├── Firmware (Arduino / .ino)
+│   ├── transmitter.ino              # earliest single-link TX-only test
+│   ├── receiver.ino                 # earliest single-link RX-only test (+ VCC/battery sag logging)
+│   ├── 1.ino                        # early two-node HELLO exchange test
+│   ├── NodeA_FINAL.ino              # early full relay firmware (source role)
+│   ├── NodeB_final.ino              # early full relay firmware (intermediate relay role)
+│   ├── NodeD_FINAL.ino              # early full relay firmware (destination role)
+│   ├── node_A_esp32_FIXED.ino       # Node A, bug-fixed (see below)
+│   ├── node_D_esp8266_FIXED.ino     # Node D, bug-fixed (see below)
+│   ├── node_TEMPLATE_esp32.ino      # generalized N-node template, ESP32
+│   └── node_TEMPLATE_esp8266.ino    # generalized N-node template, ESP8266
 │
-├── *.ino
-│   └── ESP32 / LoRa firmware files
+├── Python Simulation & Tooling
+│   ├── Normal_Mode.py               # early single-hop Tkinter/networkx demo (normal routing)
+│   ├── Emergency_mode.py            # early single-hop Tkinter/networkx demo (priority routing)
+│   ├── Load_part.py                 # early animated multi-node Tkinter/networkx load demo
+│   ├── best_weight.py               # vectorized numpy/multiprocessing sweep of w1 (RSSI weight)
+│   ├── visualizer.py                # scalable (10–10,000+ node) multi-hop mesh simulator + GUI
+│   └── lora_ai_optimizer.py         # Monte Carlo weight optimizer + sklearn emergency profiler + GUI
 │
-├── Reciver.txt
+├── Data
+│   └── result_02092026.csv          # Monte Carlo sweep output (w1/w2 vs PDR, energy, hops, etc.)
 │
+├── Reciver.txt                      # reference copy of an early receiver sketch
+├── requirements.txt                 # Python dependencies
 └── README.md
 ```
 
-The Python files provide processing and visualization functionality, while the Arduino `.ino` files represent the ESP32/LoRa embedded firmware layer.
+---
+
+# 🔌 Firmware Files
+
+| File | Role | Board | Notes |
+|---|---|---|---|
+| `transmitter.ino` | TX-only test | ESP32 | Sends a counting `<HELLO n>` packet every 2s. First hardware smoke test. |
+| `receiver.ino` | RX-only test | ESP8266 | Logs RSSI and VCC sag (`ADC_MODE(ADC_VCC)`) on every received packet — used to sanity-check the battery-drain-under-TX assumption. |
+| `1.ino` | Early two-node test | ESP8266 | First HELLO ping/reply exchange between two boards. |
+| `NodeA_FINAL.ino` / `NodeB_final.ino` / `NodeD_FINAL.ino` | Full relay firmware, fixed roles | ESP32/ESP8266 | Neighbor table, TX queue, message-dedup cache, greedy scoring — but with hardcoded roles (superseded by the `_FIXED` and `TEMPLATE` firmware below). |
+| `node_A_esp32_FIXED.ino` | Source node, bugs fixed | ESP32 | See [bug fixes](#-known-bugs-fixed-in-_fixed-firmware). |
+| `node_D_esp8266_FIXED.ino` | Destination node, bugs fixed | ESP8266 | See [bug fixes](#-known-bugs-fixed-in-_fixed-firmware). |
+| `node_TEMPLATE_esp32.ino` | **Current mesh firmware** | ESP32 | Flash the *same* file to every ESP32 board; only `NODE_ID` changes per board. Supports `<DEST_ID>:<message>` addressing to any node in the mesh. |
+| `node_TEMPLATE_esp8266.ino` | **Current mesh firmware** | ESP8266 | Same idea as above, for ESP8266 boards. |
+
+For a small demo, flash the two `_FIXED` files. For an actual N-node mesh, flash `node_TEMPLATE_esp32.ino` / `node_TEMPLATE_esp8266.ino` to every board and give each one a unique `NODE_ID`.
 
 ---
 
-# 📂 Detailed File Description
+# 🐛 Known Bugs Fixed in `_FIXED` Firmware
 
-## 1. `Emergency_mode.py`
+While debugging the two-node prototype, two issues were found and fixed:
 
-### Purpose
+1. **Node A was probing itself.** `node_A_esp32_FIXED.ino`'s `read_serial()` was copy-pasted from Node D's code, and the hardcoded probe destination was never updated from `"A"` to `"D"`. Node A was sending HELLO probes to its own node ID and never actually reaching the destination.
+2. **HELLO ping-pong starving the channel.** Both nodes replied to *every* incoming HELLO unconditionally — including replies to their own probes — which caused an infinite HELLO↔HELLO exchange that ate all the available airtime and starved real DATA packets. The fix adds a reply-flag to the HELLO packet so a node only auto-replies to a genuine probe, never to a reply to its own probe.
 
-`Emergency_mode.py` is associated with the **Emergency Mode** of the communication system.
-
-It provides the software-side implementation for handling emergency-related communication separately from standard communication.
-
-### Responsibilities
-
-* Handles emergency-mode operation.
-* Processes emergency-related information.
-* Supports priority handling of emergency information.
-* Interfaces with the overall communication workflow.
-
-### System Role
-
-```text
-Emergency Condition
-        ↓
-Emergency_mode.py
-        ↓
-Emergency Data Processing
-        ↓
-Priority Handling
-        ↓
-LoRa Communication
-```
-
-The emergency path is important because the project explicitly provides separate normal and emergency operating modes.
+Both fixes are also carried forward into `node_TEMPLATE_esp32.ino` / `node_TEMPLATE_esp8266.ino`.
 
 ---
 
-## 2. `Normal_Mode.py`
-
-### Purpose
-
-`Normal_Mode.py` is associated with the **Normal Mode** of the system.
-
-It handles the standard communication workflow when the system is operating under normal conditions.
-
-### Responsibilities
-
-* Handles normal system operation.
-* Processes regular communication data.
-* Provides the standard communication path.
-* Supports communication when no emergency condition is active.
-
-### System Role
-
-```text
-Normal Input
-     ↓
-Normal_Mode.py
-     ↓
-Data Processing
-     ↓
-LoRa Transmission
-     ↓
-Receiver
-```
-
-Normal Mode follows the standard process of collecting, processing, transmitting, receiving and displaying data.
-
----
-
-## 3. `Load_part.py`
-
-### Purpose
-
-`Load_part.py` is the **load/data-processing component** of the project.
-
-It is associated with processing information related to the system load and supporting the overall processing or decision-making workflow.
-
-### Responsibilities
-
-* Handles load-related information.
-* Performs load-related processing.
-* Produces processed information for use by other parts of the system.
-* Supports the overall system processing architecture.
-
-### System Role
-
-```text
-Input / Load Data
-       ↓
-Load Processing
-       ↓
-Load_part.py
-       ↓
-Processed Information
-       ↓
-System Decision / Communication
-```
-
-The project identifies load/data processing as one of its core software components.
-
----
-
-## 4. `best_weight.py`
-
-### Purpose
-
-`best_weight.py` is associated with **weight-based processing** within the project.
-
-It provides processing related to weight values that are used as part of the project's computational or decision-making workflow.
-
-### Responsibilities
-
-* Handles weight-related calculations.
-* Processes relevant input parameters.
-* Determines or processes weight values.
-* Supports the broader processing/decision mechanism.
-
-### System Role
-
-```text
-Input Parameters
-       ↓
-Weight Processing
-       ↓
-best_weight.py
-       ↓
-Processed Weight
-       ↓
-System Processing / Decision
-```
-
-Weight-based processing is explicitly identified as one of the project's software components.
-
----
-
-## 5. `visualizer.py`
-
-### Purpose
-
-`visualizer.py` is the **visualization and monitoring component** of the project.
-
-It is intended to make system information easier to observe and analyze instead of relying exclusively on raw data or terminal output.
-
-### Responsibilities
-
-* Handles system information for visualization.
-* Provides a human-readable representation of data.
-* Supports system monitoring.
-* Assists debugging and testing.
-* Helps evaluate communication/system behavior.
-* Supports project demonstration.
-
-### System Role
-
-```text
-System / Communication Data
-          ↓
-     visualizer.py
-          ↓
-   Data Visualization
-          ↓
-Monitoring / Analysis
-```
-
-The visualization component is intended for monitoring communication, observing transmitted/received information, debugging, performance evaluation and demonstration.
-
----
-
-## 6. Arduino `.ino` Files
-
-### Purpose
-
-The `.ino` files contain the **embedded firmware** used by the ESP32/LoRa hardware.
-
-These programs form the hardware-side implementation of the communication system.
-
-### Typical Responsibilities
-
-The embedded programs may perform functions such as:
-
-* ESP32 initialization
-* LoRa initialization
-* Data transmission
-* Data reception
-* Serial communication
-* Input/sensor data handling
-* Communication-mode handling
-* Packet processing
-* Communication between nodes
-
-### General Firmware Flow
-
-```text
-ESP32 Startup
-      ↓
-Hardware Initialization
-      ↓
-LoRa Initialization
-      ↓
-Read / Process Data
-      ↓
-Transmit / Receive
-      ↓
-Packet Handling
-      ↓
-Output / Communication
-      ↓
-Repeat
-```
-
-The `.ino` files therefore represent the **embedded and communication layer** of the project.
-
-> The repository contains multiple `.ino` files. Their individual functions should be documented separately once their source code is finalized and identified.
-
----
-
-## 7. `Reciver.txt`
-
-### Purpose
-
-`Reciver.txt` contains receiver-related material associated with the project.
-
-It is related to the **receiver side** of the communication system.
-
-### Receiver Workflow
-
-```text
-LoRa Wireless Signal
-        ↓
-LoRa Receiver
-        ↓
-ESP32
-        ↓
-Packet Reception
-        ↓
-Data Processing
-        ↓
-Output / Visualization
-```
-
-The receiver is responsible for obtaining information transmitted through the LoRa communication link and making that information available for further processing or display.
-
-### Naming Note
-
-The current repository filename is:
-
-```text
-Reciver.txt
-```
-
-For consistency and readability, the filename could be changed to:
-
-```text
-Receiver.txt
-```
-
-provided that no existing code or documentation depends on the current filename.
-
----
-
-# 🧩 File Responsibilities at a Glance
-
-| File                | Layer                      | Primary Responsibility                       |
-| ------------------- | -------------------------- | -------------------------------------------- |
-| `Emergency_mode.py` | Application / Processing   | Emergency-mode communication and processing  |
-| `Normal_Mode.py`    | Application / Processing   | Normal-mode communication and processing     |
-| `Load_part.py`      | Processing                 | Load/data-related processing                 |
-| `best_weight.py`    | Processing / Algorithm     | Weight-based processing                      |
-| `visualizer.py`     | Monitoring / Visualization | Data visualization and system monitoring     |
-| `.ino` files        | Embedded / Communication   | ESP32 and LoRa firmware                      |
-| `Reciver.txt`       | Receiver                   | Receiver-side implementation/reference       |
-| `README.md`         | Documentation              | Project documentation and usage instructions |
-
----
-
-# 🔗 How the Files Work Together
-
-The project can be understood as a pipeline in which data moves from input and processing through the embedded communication system and finally to monitoring/visualization.
-
-```text
-                         INPUT
-                           │
-                           ▼
-              ┌────────────────────────┐
-              │   Data / Load Handling │
-              │      Load_part.py      │
-              └───────────┬────────────┘
-                          │
-                          ▼
-              ┌────────────────────────┐
-              │   Weight Processing    │
-              │    best_weight.py      │
-              └───────────┬────────────┘
-                          │
-                          ▼
-                 ┌─────────────────┐
-                 │  MODE SELECTION │
-                 └────────┬────────┘
-                          │
-                ┌─────────┴─────────┐
-                │                   │
-                ▼                   ▼
-       ┌─────────────────┐  ┌─────────────────┐
-       │   Normal Mode   │  │ Emergency Mode  │
-       │ Normal_Mode.py  │  │Emergency_mode.py│
-       └────────┬────────┘  └────────┬────────┘
-                │                   │
-                └─────────┬─────────┘
-                          │
-                          ▼
-              ┌────────────────────────┐
-              │    ESP32 + LoRa        │
-              │    Embedded Layer      │
-              └───────────┬────────────┘
-                          │
-                     LoRa Link
-                          │
-                          ▼
-              ┌────────────────────────┐
-              │     LoRa Receiver      │
-              │       ESP32            │
-              └───────────┬────────────┘
-                          │
-                          ▼
-              ┌────────────────────────┐
-              │    Data Processing     │
-              │    / Output            │
-              └───────────┬────────────┘
-                          │
-                          ▼
-              ┌────────────────────────┐
-              │      visualizer.py     │
-              │ Visualization / Monitor│
-              └────────────────────────┘
-```
-
----
-
-# 🏛️ Software-Hardware Relationship
-
-The complete project can be divided into three primary layers.
-
-## Application and Processing Layer
-
-The Python programs provide the higher-level processing:
-
-```text
-Emergency_mode.py
-Normal_Mode.py
-Load_part.py
-best_weight.py
-```
-
-These files handle the different operating modes and processing functions.
-
-## Communication and Embedded Layer
-
-The ESP32 and LoRa firmware provide the hardware communication layer:
-
-```text
-Arduino .ino files
-Reciver.txt
-```
-
-This layer is responsible for implementing the physical LoRa communication and receiver-side functionality.
-
-## Monitoring Layer
-
-The visualization layer provides a human-readable representation of system information:
-
-```text
-visualizer.py
-```
-
-Together, these layers form the software and embedded architecture of the LoRa Based Communication System.
-
----
-
-# 📡 Why LoRa?
-
-LoRa is used as the wireless communication technology because it is suitable for applications requiring long-range communication with relatively low power consumption.
-
-The project identifies the following characteristics as important:
-
-* Long communication range
-* Low power consumption
-* Good receiver sensitivity
-* Operation without cellular infrastructure
-* Suitable data rates for sensor/control information
-* Support for point-to-point and networked communication
-
-Unlike Wi-Fi, the LoRa communication link does not require a conventional local Wi-Fi network.
+# 🐍 Python Simulation & Tooling
+
+| File | What it does |
+|---|---|
+| `Normal_Mode.py` | Early single-hop LoRa demo (Tkinter GUI + `networkx` topology view) — standard-priority routing baseline used before the greedy relay logic existed. |
+| `Emergency_mode.py` | Same demo as above, adapted for priority/emergency-flagged traffic. |
+| `Load_part.py` | Animated multi-node Tkinter/`networkx` load-handling demo (`matplotlib.animation`) — visualizes how load is distributed across a small network. |
+| `best_weight.py` | Sweeps the RSSI weight `w1` from 0→1 in steps of 0.01 (`w2 = 1 - w1`) to find the weighting that best balances PDR, network lifetime, and end-to-end delay. Vectorized with numpy and parallelized across CPU cores with `multiprocessing.Pool` (a rewrite of an earlier MATLAB script). |
+| `visualizer.py` | The main **scalable multi-hop mesh simulator** — supports 10 to 10,000+ simulated nodes with a live GUI, CSMA/CA collision modeling, an energy model, and CSV logging of every run. The core `compute_rssi()`, `greedy_neighbor()`, and `custom_greedy()` routing functions are kept byte-identical to the original algorithm so simulation results stay comparable across versions. |
+| `lora_ai_optimizer.py` | The most advanced tool: a 4-tab Tkinter GUI (**Optimizer / Emergency / Results / Network**) that runs a full **Monte Carlo engine** across randomized area, battery, node count, and deployment, does a coarse 10×10 grid search followed by a fine random search over `(w1, w2)`, and trains a small `sklearn` `MLPRegressor` on the resulting dataset to extract 3 emergency-traffic profiles via K-Means. |
+
+`result_02092026.csv` is a sample output of the Monte Carlo sweep — each row is one `(w1, w2)` candidate with its mean PDR, energy use, collision rate, channel utilization, hop count, reach rate, remaining battery, RSSI, and neighbor count across all trials.
 
 ---
 
 # 🔧 Hardware Requirements
 
-The project is primarily based on **ESP32 and LoRa hardware**.
+| Component | Purpose |
+|---|---|
+| ESP32 dev board | Mesh node (VSPI wiring, see below) |
+| ESP8266 dev board (e.g. NodeMCU / Wemos D1 mini) | Mesh node (lower-cost alternative role) |
+| SX127x / Ra-02 LoRa module | 433 MHz LoRa radio |
+| Antenna (433 MHz) | Matched to the module/region |
+| USB cables + power source per node | Node power |
+| Computer | Flashing firmware, running the Python simulators/optimizer |
 
-Typical components include:
-
-| Component             | Purpose                                   |
-| --------------------- | ----------------------------------------- |
-| ESP32                 | Main microcontroller                      |
-| LoRa Module           | Long-range wireless communication         |
-| Antenna               | LoRa signal transmission/reception        |
-| Power Supply          | Powers the communication nodes            |
-| Sensors/Input Devices | Generate system data                      |
-| Computer              | Development, monitoring and visualization |
-
-The exact LoRa module, sensor models, pin configuration, frequency and power requirements depend on the hardware used in the final implementation.
+> ⚠️ 433 MHz is used throughout (`FREQUENCY 433E6`) — confirm this is legal in your region before transmitting, and adjust if not.
 
 ---
 
-# 💻 Software Requirements
+# 🔌 Wiring
 
-The project requires the following software environment:
+**ESP32 (VSPI) — `node_TEMPLATE_esp32.ino` / `node_A_esp32_FIXED.ino`:**
 
-* **Arduino IDE**
-* **ESP32 Board Support Package**
-* **Python 3.x**
-* Required Python libraries
-* Serial communication support
-* LoRa-compatible Arduino libraries
+| LoRa Pin | ESP32 GPIO |
+|---|---|
+| NSS / CS | 5 |
+| RST | 14 |
+| DIO0 | 26 |
+| SCK | 18 |
+| MISO | 19 |
+| MOSI | 23 |
+
+**ESP8266 — `node_TEMPLATE_esp8266.ino` / `node_D_esp8266_FIXED.ino`:**
+
+| LoRa Pin | ESP8266 Pin |
+|---|---|
+| NSS / CS | 15 (D8) |
+| RST | 5 (D1) |
+| DIO0 | 4 (D2) |
+
+(SPI SCK/MISO/MOSI use the ESP8266's default hardware SPI pins.)
 
 ---
 
-# ⚙️ Installation
+# 💻 Software Requirements & Installation
 
-## 1. Clone the Repository
+* **Arduino IDE** with ESP32 and ESP8266 board packages installed
+* The [`LoRa` Arduino library](https://github.com/sandeepmistry/arduino-LoRa) (Sandeep Mistry) — used via `#include <LoRa.h>` and `#include <SPI.h>`
+* **Python 3.x** for the simulation/optimizer tools
+
+Clone the repo:
 
 ```bash
 git clone https://github.com/Aadit2308/Major-Project.git
 cd Major-Project
 ```
 
-## 2. Install Python
-
-Install Python 3.x.
-
-Verify the installation:
-
-```bash
-python --version
-```
-
-## 3. Install Python Dependencies
-
-If a `requirements.txt` file is provided in the project:
+Install Python dependencies:
 
 ```bash
 pip install -r requirements.txt
 ```
 
-Otherwise, install the dependencies required by the individual Python programs.
+`requirements.txt` currently lists: `numpy`, `pandas`, `matplotlib`, `pyserial`. For the fuller feature set in `visualizer.py` and `lora_ai_optimizer.py`, also install the optional extras they auto-detect at import time:
 
----
-
-# 🔌 ESP32 Setup
-
-1. Install **Arduino IDE**.
-2. Install ESP32 board support.
-3. Connect the ESP32 to the computer using USB.
-4. Select the appropriate ESP32 board.
-5. Select the correct serial/COM port.
-6. Open the appropriate `.ino` firmware file.
-7. Configure the LoRa pins according to the hardware.
-8. Configure the LoRa communication parameters.
-9. Compile the firmware.
-10. Upload it to the ESP32.
-
-The transmitter and receiver must use compatible LoRa communication parameters.
-
----
-
-# 📡 LoRa Configuration
-
-The transmitter and receiver should be configured with compatible parameters, including:
-
-* Frequency
-* Spreading Factor
-* Bandwidth
-* Coding Rate
-* Sync Word
-* Transmission Power
-
-Example:
-
-```text
-Frequency        : Region-dependent
-Spreading Factor : Configurable
-Bandwidth        : Configurable
-Coding Rate      : Configurable
-TX Power         : Hardware/regulation-dependent
+```bash
+pip install scipy scikit-learn networkx
 ```
 
-The LoRa frequency must comply with the regulations applicable to the region where the system is operated.
+(Both scripts degrade gracefully — `scipy`'s KD-tree speeds up neighbor lookups but isn't required, and `sklearn` is only needed for the Emergency Profiler tab in `lora_ai_optimizer.py`.)
 
 ---
 
-# ▶️ System Workflow
+# ⚡ Flashing a Mesh Node
 
-The overall operating workflow is:
+1. Open `node_TEMPLATE_esp32.ino` (for ESP32 boards) or `node_TEMPLATE_esp8266.ino` (for ESP8266 boards) in Arduino IDE.
+2. Change **only** the `NODE_ID` line to a unique single letter for this board (`"A"`, `"B"`, `"C"`, `"D"`, ...). Nothing else needs editing.
+3. Wire the LoRa module as described above.
+4. Select the correct board and serial port in Arduino IDE.
+5. Upload.
+6. Open the Serial Monitor at `115200` baud.
+7. To send a message to another node, type `<DEST_ID>:<message>` and press Enter — e.g. `C:sensor reading is 42` sends to Node C, hopping through relays as needed.
+8. An idle node stays in pure-RX mode and only transmits when you send, when relaying someone else's traffic, or when replying to a genuine HELLO probe.
 
-```text
-START
-  │
-  ▼
-Initialize ESP32
-  │
-  ▼
-Initialize LoRa
-  │
-  ▼
-Read Input Data
-  │
-  ▼
-Process Data
-  │
-  ▼
-Determine Operating Mode
-  │
-  ├───────────────┐
-  ▼               ▼
-NORMAL         EMERGENCY
-MODE              MODE
-  │               │
-  └───────┬───────┘
-          │
-          ▼
-     Process Data
-          │
-          ▼
-    Transmit via LoRa
-          │
-          ▼
-     Receive Data
-          │
-          ▼
-   Process / Display
-          │
-          ▼
-        REPEAT
-```
-
-This represents the general system workflow described by the project documentation.
+Repeat for every board in the mesh, giving each one a different `NODE_ID`.
 
 ---
 
-# 🚨 Emergency Communication
+# 🖥️ Running the Python Tools
 
-Emergency communication is one of the key features of the system.
+```bash
+# Weight sweep (best RSSI vs. battery weighting)
+python best_weight.py
 
-The emergency path is intended to handle high-priority information separately from normal communication.
+# Scalable multi-hop mesh simulator with GUI
+python visualizer.py
 
-```text
-Normal Data ────────────────┐
-                            │
-                            ▼
-                      Priority Check
-                            │
-                   ┌────────┴────────┐
-                   │                 │
-                   ▼                 ▼
-            Normal Priority   Emergency Priority
-                   │                 │
-                   ▼                 ▼
-             Normal Queue      Priority Handling
-                   │                 │
-                   └────────┬────────┘
-                            │
-                            ▼
-                         LoRa Link
+# Monte Carlo weight optimizer + emergency profiler GUI
+python lora_ai_optimizer.py
 ```
 
-This architecture allows the project to distinguish between normal and emergency communication requirements.
+All three write/consume CSV logs (see `result_02092026.csv` for the expected sweep-output format) so runs can be compared across sessions without re-running the full Monte Carlo pass each time.
 
 ---
 
-# 📊 Data Visualization
+# 📊 Simulation Results
 
-The project includes:
-
-```text
-visualizer.py
-```
-
-The visualization component is intended to make system information easier to observe and analyze.
-
-It can support:
-
-* Communication monitoring
-* Observation of transmitted/received information
-* Debugging
-* Performance evaluation
-* Project demonstration
+`result_02092026.csv` records, per `(w1, w2)` candidate, the mean across all Monte Carlo trials for: **PDR**, **energy consumption**, **collision rate**, **channel utilization**, **hop count**, **reach rate**, **remaining battery**, **RSSI**, and **neighbor count**. This is the dataset used to pick the default `W1 = 0.6` / `W2 = 0.4` weighting baked into the firmware.
 
 ---
 
 # 🔬 Applications
 
-The communication architecture can be adapted for applications such as:
-
-* Disaster communication
-* Emergency response systems
-* Remote monitoring
-* Industrial communication
-* Rural communication
-* Infrastructure monitoring
-* Sensor networks
-* Search-and-rescue communication
-* Communication in areas with limited network connectivity
-
----
-
-# ✅ Advantages
-
-* Long-range wireless communication
-* Low power requirements
-* Communication without dependence on conventional cellular infrastructure
-* Suitable for remote environments
-* Dedicated emergency communication mode
-* ESP32 provides local processing capability
-* Architecture can be extended to multiple nodes
+* Disaster-response and search-and-rescue communication
+* Off-grid sensor networks where node lifetime matters more than raw throughput
+* Rural or infrastructure-poor area monitoring
+* Any scenario needing multi-hop coverage extension beyond a single LoRa node's range
 
 ---
 
 # ⚠️ Limitations
 
-The project has several inherent limitations associated with LoRa-based communication:
-
-* LoRa has lower data rates than technologies such as Wi-Fi.
-* It is more appropriate for small packets than high-bandwidth data.
-* Communication range depends on antenna characteristics, environment, frequency, spreading factor and transmission power.
-* LoRa frequency bands and transmission parameters are subject to regional regulations.
-* Network scalability depends on the communication protocol and architecture implemented.
-
----
-
-# 🧪 Testing and Performance Evaluation
-
-The system can be evaluated using several communication and system-performance parameters.
-
-| Parameter                   | Purpose                                                   |
-| --------------------------- | --------------------------------------------------------- |
-| **Communication Range**     | Determines the maximum reliable communication distance    |
-| **Packet Delivery Ratio**   | Measures the percentage of successfully delivered packets |
-| **Latency**                 | Measures communication delay                              |
-| **Throughput**              | Measures effective data transfer                          |
-| **Power Consumption**       | Evaluates energy efficiency                               |
-| **Emergency Response Time** | Measures how quickly emergency information is handled     |
-| **Reliability**             | Evaluates communication stability                         |
-
-Testing should be conducted at different distances and under different environmental conditions to evaluate practical system performance.
+* LoRa's low data rate limits this to small control/telemetry packets, not bulk data.
+* Greedy (locally-optimal) relay selection can still make globally suboptimal choices compared to a full routing-table approach.
+* `HELLO_REPLY_WAIT` (3s) and backoff windows trade responsiveness for collision avoidance — tune per deployment density.
+* 433 MHz operation and TX power must comply with local spectrum regulations.
+* Firmware assumes a single-letter `NODE_ID` namespace (`MAX_NEIGHBORS` currently capped at 16 on the ESP32 template).
 
 ---
 
 # 🔮 Future Improvements
 
-Possible future enhancements include:
-
-* Multi-node mesh/network communication
-* Improved routing algorithms
-* Automatic emergency detection
-* Encryption and authentication
-* Adaptive LoRa transmission parameters
-* Improved congestion management
-* Battery and power optimization
-* GPS integration
-* Cloud/dashboard integration where infrastructure is available
-* Mobile monitoring application
-* Improved visualization and analytics
-* Automatic fault detection
-* Robust packet acknowledgement and retransmission mechanisms
-
----
-
-# 📜 Project Information
-
-**Project Name:**
-LoRa Based Communication System
-
-**Repository:**
-[Major-Project](https://github.com/Aadit2308/Major-Project)
-
-**Technology:**
-LoRa + ESP32 + Python + Arduino
-
-**Communication Type:**
-Long-range wireless communication
-
-**Operating Modes:**
-
-* Normal Mode
-* Emergency Mode
+* Merge the `_FINAL` / `_FIXED` firmware history into a single maintained template (currently kept for reference/debugging history)
+* Persist battery/energy state across reboots (currently resets to `INITIAL_BATTERY` on power-cycle)
+* Field-test the Monte-Carlo-derived weights against the physical mesh and feed real RSSI/PDR data back into `lora_ai_optimizer.py`
+* Encryption/authentication on HELLO and DATA packets
+* Automatic retransmission/ACK layer for lost DATA packets
+* Cloud/dashboard logging when backhaul is available
 
 ---
 
 # 📜 License
 
-This project is intended primarily for **academic and educational purposes**.
-
-If the project is intended for public redistribution or reuse, an appropriate open-source license should be added to the repository.
+This project is intended primarily for **academic and educational purposes** (VESIT E&TC major project). If it's reused or redistributed publicly, add an appropriate open-source license to the repository.
 
 ---
 
 # ⭐ Acknowledgements
 
-This project was developed as an academic major-project implementation involving:
-
-* Embedded systems
-* ESP32 microcontrollers
-* LoRa wireless communication
-* Python-based processing
-* Data visualization
-* Emergency communication concepts
-
----
-
-## 👥 Project Structure Summary
-
-```text
-                         LoRa Based
-                    Communication System
-                            │
-             ┌──────────────┼──────────────┐
-             │              │              │
-             ▼              ▼              ▼
-        APPLICATION     EMBEDDED        MONITORING
-           LAYER          LAYER            LAYER
-             │              │              │
-      ┌──────┼──────┐       │              │
-      │      │      │       │              │
-      ▼      ▼      ▼       ▼              ▼
-   Normal Emergency Load   ESP32 +      visualizer.py
-   Mode    Mode      /     LoRa
-           Weight
-             │
-             ▼
-       Python Programs
-```
-
-The complete system combines these components to provide a long-range LoRa communication platform with separate normal and emergency operating modes, processing functionality, embedded ESP32/LoRa communication, and visualization capabilities.
+Developed as a VESIT Electronics & Telecommunication Engineering major project by **Aadit** accompanying the paper *"Hybrid RSSI–Battery Greedy Relay Selection for Energy-Efficient Multi-Hop LoRa Mesh Networks in Disaster Scenarios."*
